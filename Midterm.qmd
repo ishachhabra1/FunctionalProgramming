@@ -1,0 +1,248 @@
+---
+title: "Midterm"
+author: "Isha Chhabra"
+format:
+  html:
+    embed-resources: true
+execute:
+  cache: true
+---
+
+## Part A: Data
+```{r}
+library(tidyverse)
+library(glue)
+library(rio)
+
+download_file <- function(year) {
+  link <- glue::glue("https://www.oregon.gov/ode/educator-resources/assessment/TestResults20{year}/pagr_schools_ela_raceethnicity_{year-1}{year}.xlsx")
+  rio::import(link, setclass = "tibble", na = c("-", "--", "*"))
+}
+```
+## 1A
+```{r}
+data <- map_dfr(15:18, download_file) #week 4 slide 28
+```
+
+```{r}
+str(data)
+#clean data
+data_clean <- data |>
+  janitor::clean_names() |> #convert everything to consistent form
+  filter(student_group %in% c("White", "Hispanic/Latino")) |> #filter for students, slide 113 week 4
+  select(academic_year, district, school, student_group, grade_level, number_level_1, number_level_2, number_level_3, number_level_4) |> #need the first 5 since need those later/in table in assignment
+  pivot_longer(
+    cols = starts_with("number_level"),
+    names_to = "level",
+    names_prefix = "number_level_",
+    values_to = "n"
+  ) |>
+  drop_na(n) |>
+  mutate(n = as.integer(n))
+str(data_clean)
+```
+## 2A
+```{r}
+schools_df <- data_clean |>
+  group_by(academic_year, district) |>
+  summarize(n_schools = n_distinct(school), .groups = "drop")
+#below wasn't working, so needed to see if I should split up group_by. Here is the citation: https://claude.ai/share/246bbda8-9deb-467b-8d08-e4a0bf4c3584
+
+d <- data_clean |> #named d since assignment had a code chunk I copied in naming using d
+  group_by(academic_year, district, student_group, level) |>
+  summarize(n = sum(n), .groups = "drop") |>
+  pivot_wider(
+    names_from  = student_group,
+    values_from = n,
+    names_repair = janitor::make_clean_names
+  ) |>
+  drop_na(hispanic_latino, white) |>
+  left_join(schools_df, by = c("academic_year", "district")) |>
+  relocate(n_schools, .after = district) #used claude to learn what relocate is and how to join 2 df together: https://claude.ai/share/0e5de394-49d8-4219-ac84-e75c4813e2fb
+str(d)
+```
+```{r}
+#troubleshooting for why my dataframe doesn't match yours.. so code above it is correct, just arranged differently..
+distinct(data, Subject)
+d |> 
+  arrange(district, academic_year, level) |>
+  slice(1:10)
+```
+```{r}
+#can sort to completely match:
+matchassignment <- data_clean |>
+  group_by(academic_year, district, student_group, level) |>
+  summarize(n = sum(n), .groups = "drop") |>
+  pivot_wider(
+    names_from  = student_group,
+    values_from = n,
+    names_repair = janitor::make_clean_names
+  ) |>
+  drop_na(hispanic_latino, white) |>
+  left_join(schools_df, by = c("academic_year", "district")) |>
+  relocate(n_schools, .after = district) |>
+  arrange(district, academic_year, level)
+str(matchassignment)
+```
+
+## Part B
+## 1B
+```{r}
+#remotes::install_github("datalorax/gapr")
+
+library(gapr)
+
+d[1:4, ] |>
+  estimate_v("white", "hispanic_latino") #from assignment
+
+#Method 1: use nest and groupby
+v1 <- d |> #week 4 notes
+  group_by(academic_year, district, n_schools) |>
+  nest() |>
+  mutate(
+    v_out = map(data, ~estimate_v(.x, "white", "hispanic_latino")) #from above used estimate_v
+  ) |>
+  unnest(v_out) |> #slide 108
+  select(-data) #- = drop
+
+#Method 2: use summarize and nestby
+v2 <- d |> #also week 4 notes
+  nest_by(academic_year, district, n_schools) |>
+  summarize(
+    estimate_v(data, "white", "hispanic_latino"),
+    .groups = "drop"
+  )
+```
+
+## 2B
+```{r}
+v1
+v2
+#compare plots
+compare <- left_join( #figured out how to use left_join from 2A where I used claude (cited in that problem)
+  v1 |> select(academic_year, district, v) |> rename(v_method1 = v),#need to rename both column headers to match so that I can combine
+  v2 |> select(academic_year, district, v) |> rename(v_method2 = v)
+)
+
+
+ggplot(compare, aes(v_method1, v_method2)) +
+  geom_point(alpha = 0.3) +
+  geom_abline(color = "lightblue") +
+  labs(
+    x = "Method 1",
+    y = "Method 2",
+    title = "Achievement gap estimates are equal across methods"
+  )
+```
+
+## 3B
+```{r}
+dists <- unique(v1$district)[1:100] #from assignment
+#Method 1
+plots1 <- v1 |>
+  filter(district %in% dists) |>
+  group_by(district) |> #week 4 notes
+  nest() |>
+  mutate(plots = map2(district, data, ~{ #map 2 from week 5 notes- Pulitzer example
+    ggplot(.y, aes(academic_year, y= v, group = 1)) + #claude helped me with this! https://claude.ai/share/798f0399-cd96-49ad-96bf-b82363b4c535
+      geom_hline(yintercept = 0, color = "red") +
+      geom_line(color = "gray60") +
+      geom_errorbar(
+        aes(ymin = v - 1.96*v_se, ymax = v + 1.96*v_se), #assumed 1.96 confidence interval
+        color = "gray60",
+        width = 0.2
+      ) +
+      geom_point(aes(color = v > 0), size = 3) + #color = v > 0 Used same claude link to do the conditional color match https://claude.ai/share/798f0399-cd96-49ad-96bf-b82363b4c535
+      scale_color_manual(
+        values = c("TRUE" = "skyblue", "FALSE" = "orchid"), #tried matching colors!
+        guide = "none"
+      ) +
+      labs(
+        title = glue("Achievement Gap Estimates: {.x}"), #all title, subtitle, x, y axis, caption labels from assignment
+        subtitle = "Negative values indicate White students have higher average achievement\nPositive values indicate Hispanic/Latino students have higher average achievement",
+        x = "Academic Year",
+        y = "Average achievement difference (SD units)",
+        caption = glue("Number of schools: {unique(.y$n_schools)}")
+      )
+  }))
+
+#Method 2: 
+plots2 <- v1 |> #week 5 notes- literally identical
+  filter(district %in% dists) |>
+  ungroup() |>
+  nest_by(district) |>
+  mutate(plots = list(
+    ggplot(data, aes(academic_year, v, group = 1)) +
+      geom_hline(yintercept = 0, color = "red") +
+      geom_line(color = "gray60") +
+      geom_errorbar(
+        aes(ymin = v - 1.96*v_se, ymax = v + 1.96*v_se),
+        color = "gray60",
+        width = 0.2
+      ) +
+      geom_point(aes(color = v > 0), size = 3) +
+      scale_color_manual(
+        values = c("TRUE" = "skyblue", "FALSE" = "orchid"),
+        guide = "none"
+      ) +
+      labs(
+        title = glue("Achievement Gap Estimates: {district}"),
+        subtitle = "Negative values indicate White students have higher average achievement\nPositive values indicate Hispanic/Latino students have higher average achievement",
+        x = "Academic Year",
+        y = "Average achievement difference (SD units)",
+        caption = glue("Number of schools: {unique(data$n_schools)}")
+      )
+  ))
+
+#verify plots look right
+plots1$plots[[1]]
+plots1$plots[[29]]
+
+plots2$plots[[1]]
+plots2$plots[[29]]
+```
+## 4B
+```{r}
+fs::dir_create(here::here("plots"))
+#test 5 first
+#walk2 from week 5 notes
+walk2(plots1$plots[1:5], plots1$district[1:5], ~ggsave( #from B3
+  filename = here::here("plots", glue("{janitor::make_clean_names(.y)}_method1.png")), #used claude to see if I can combine glue and janitor https://claude.ai/share/627eb2aa-c6c6-440e-b78f-ab130c123651
+  plot = .x, 
+  width = 6, 
+  height = 4
+))
+
+walk2(plots1$plots, plots1$district, ~ggsave(
+  filename = here::here("plots", glue("{janitor::make_clean_names(.y)}_method1.png")),
+  plot = .x,
+  width = 6,
+  height = 4
+))
+
+walk2(plots2$plots, plots2$district, ~ggsave(
+  filename = here::here("plots", glue("{janitor::make_clean_names(.y)}_method2.png")),
+  plot = .x,
+  width = 6,
+  height = 4
+))
+```
+
+## Extra Credit 
+```{r}
+#combine
+library(patchwork)
+comparison_plots <- map2(plots1$plots, plots2$plots, ~(.x | .y)) #week 5 notes
+
+#verify
+comparison_plots[[1]]
+
+#save
+walk2(comparison_plots, plots1$district, ~ggsave(
+  filename = here::here("plots", glue("{janitor::make_clean_names(.y)}_comparison.png")),
+  plot = .x,
+  width = 12,
+  height = 4
+))
+```
+
