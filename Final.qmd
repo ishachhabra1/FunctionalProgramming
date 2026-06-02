@@ -1,0 +1,260 @@
+---
+title: "Final"
+author: "Isha Chhabra"
+format:
+  html:
+    embed-resources: true
+---
+
+
+```{r}
+library(httr)
+library(jsonlite)
+library(kableExtra)
+library(here)
+library(digest)
+library(fs)
+library(lme4)
+library(tidyverse)
+```
+
+## Question 1
+```{r}
+
+#get player list code from assignment
+response <- GET('https://api.chess.com/pub/country/US/players')
+
+player_list <- fromJSON(rawToChar(response$content))$players
+#from assignment for one username
+info <- GET('https://api.chess.com/pub/player/--untouchable--')
+fromJSON(rawToChar(info$content))
+stats <- GET('https://api.chess.com/pub/player/--untouchable--/stats')
+fromJSON(rawToChar(stats$content))
+
+player_df <- function(username) {
+  info  <- GET(paste0('https://api.chess.com/pub/player/', username))
+  info  <- fromJSON(rawToChar(info$content))
+  stats <- GET(paste0('https://api.chess.com/pub/player/', username, '/stats'))
+  stats <- fromJSON(rawToChar(stats$content))
+  tibble( #googled the tidyverse language and this came up %||%
+    username          = username,
+    name              = info$name                      %||% NA,
+    followers         = info$followers                 %||% NA,
+    location          = info$location                  %||% NA,
+    last_online       = as.POSIXct(info$last_online, origin = "1970-01-01", tz = "UTC"), #from hint
+    rapid_last_rating = stats$chess_rapid$last$rating  %||% NA,
+    rapid_best_rating = stats$chess_rapid$best$rating  %||% NA,
+    rapid_record_win  = stats$chess_rapid$record$win   %||% NA,
+    rapid_record_loss = stats$chess_rapid$record$loss  %||% NA,
+    rapid_record_draw = stats$chess_rapid$record$draw  %||% NA
+  )
+}
+
+chess_df <- map_dfr(player_list[1:500], player_df) #week 4
+
+chess_df |> 
+  kable() |>
+  kable_styling() #print(chess_df) looked ugly.. used styling to make it better
+```
+## Question 2
+```{r}
+data_q2 <- here("data", "FuncConn")
+
+#list all CSV files- week 4 notes
+all_files <- dir_ls(data_q2, regexp = "\\.csv$", recurse = TRUE) 
+all_files <- all_files[grepl("2026-05", all_files)]
+
+file_df <- tibble(
+  path = all_files,
+  hash = map_chr(all_files, tools::md5sum) #used claude to find out if two have same hash and how to identify: https://claude.ai/share/06cd9ab1-d150-4663-a6b4-d2e5526750a4
+)
+cat("Total files before:", length(all_files), "\n")
+#keep original, group hash
+duplicates_df <- file_df |>
+  group_by(hash) |> #group files by MD5 hash
+  filter(n() > 1) |> #keep only groups that have duplicates
+  arrange(path) |> #sort alphabetically- organized
+  mutate(is_original = row_number() == 1) |> #make the first file in each group original and rest duplicates
+  ungroup() #remove grouping
+
+originals  <- duplicates_df |> filter( is_original)
+duplicates <- duplicates_df |> filter(!is_original) #TRUE to FALSE
+
+#Delete duplicates from week 5 notes
+walk(duplicates$path, file.remove)
+
+#table
+tibble(
+  original_kept     = originals$path,
+  duplicate_deleted = duplicates$path
+) |> knitr::kable()
+
+cat("Total files after:", length(list.files(data_q2, recursive = TRUE)), "\n")
+```
+
+## Question 3
+```{r}
+benchmarks <- read_csv(here("data", "benchmarks.csv"))
+str(benchmarks)
+#Recode season -> wave and change season values
+benchmarks <- benchmarks |>
+  mutate(wave = case_when(
+    season == "fall"   ~ 0,
+    season == "winter" ~ 1,
+    season == "spring" ~ 2
+  ))
+
+#fit LME and compute slope reliability for one grade-subject subset- From week 6
+slope_rel <- function(df, outcome) {
+  # rename outcome column to score
+  df <- rename(df, score = all_of(outcome))
+  #numerator
+  lme_fit <- suppressWarnings(
+    lmer(score ~ 1 + wave + (1 + wave | sid), REML = FALSE, data = df)
+  ) #from assignment- says to suppress warnings
+  
+  #true score var
+  true_var <- as.data.frame(VarCorr(lme_fit)) |>
+    filter(grp == "sid", var1 == "wave", is.na(var2)) |>
+    pull(vcov) #used Claude to help with this code true_var: https://claude.ai/share/8b68cd78-2ed0-4299-925d-9cdafbbf4318
+  
+  #fit lm for each student - denominator
+  obs_slopes <- split(df, df$sid) |> #from week 4 notes
+    map_dbl(~coef(lm(score ~ 1 + wave, data = .x))[["wave"]]) #changed to just use wave variable from lm(score ~ 1+ wave, data = student)
+  #observed score variance
+  obs_var <- var(obs_slopes)
+  
+  #slope reliability formula
+  as.numeric(true_var) / obs_var
+}
+
+#all grade and subject combo
+results <- map_dfr(c(3, 4, 5), function(g) {
+  map_dfr(c("reading", "math"), function(subj) {
+    tibble(
+      grade             = g,
+      subject           = subj,
+      slope_reliability = round(slope_rel(filter(benchmarks, grade == g), subj), 4)
+    )
+  })
+})
+results |> knitr::kable()
+
+#results |> select(-model) |> knitr::kable()
+```
+
+## Question 4
+```{r}
+#refit model for Q4- Used Claude to help with models function: https://claude.ai/share/98603a5d-e6b5-49e9-a517-8e90f0b02d17
+models <- map_dfr(c(3, 4, 5), function(g) {
+  map_dfr(c("reading", "math"), function(subj) { #nested in 2 subjects for each grade from Week 4
+    df <- benchmarks |> filter(grade == g) |> rename(score = all_of(subj)) #filter keeps only rows that grade. rename to score like before
+    lme_fit <- suppressWarnings(
+      lmer(score ~ 1 + wave + (1 + wave | sid), REML = FALSE, data = df) #from assignment
+    )
+    tibble( #create one row for each grade/subject combo
+      grade   = g,
+      subject = subj,
+      model   = list(lme_fit)
+    )
+  })
+})
+
+slope_reliability <- function(lmer_obj) { #from week 6 slides
+  true_var <- as.data.frame(VarCorr(lmer_obj)) |> #extract variance
+    filter(grp != "Residual", var1 == "wave", is.na(var2)) |>
+    pull(vcov) #extracts number for numerator
+  
+  mf     <- model.frame(lmer_obj) #name model frame that extracts data.. week 6
+  mf$sid <- lmer_obj@flist[[1]] #pulls student ID's and add back to mf
+  
+  obs_slopes <- split(mf, mf$sid) |>
+    map_dbl(~coef(lm(score ~ 1 + wave, data = .x))[["wave"]]) #week 4
+  
+  as.numeric(true_var) / var(obs_slopes)
+}
+
+models |>
+  mutate(slope_reliability = round(map_dbl(model, ~slope_reliability(.x)), 4)) |>
+  select(grade, subject, slope_reliability) |>
+  knitr::kable()
+```
+
+## Question 5
+```{r}
+#Used claude twice to help with function and using safely: https://claude.ai/share/359d3313-1685-4958-b03f-a20f0fe49c1f
+#bootstrap- week 5 and 6 notes
+bootstrap_samples <- function(df, id_var, time_var, outcome_var, n_boot) {
+  ids <- unique(df[[id_var]]) #unique IDs
+  n   <- length(ids) #count students
+  #week 5 maps notes
+  map(seq_len(n_boot), function(i) { #Week 5
+    sampled_ids <- ids[base::sample(seq_len(n), size = n, replace = TRUE)] #sample with replacement (from notes in my other data class)
+    
+    #map2_dfr to bind rows week 4
+    map2_dfr(sampled_ids, seq_along(sampled_ids), function(id, idx) {
+      df |>
+        filter(.data[[id_var]] == id) |> #week 7, retain fall, winter, spring courses
+        mutate("{id_var}" := paste0(id, "_", idx))
+    }) #makes sure lmer doesn't get confused with bootstrapping- renames duplicate students
+  })
+}
+
+#slope reliability from q4- except takes in raw df and fits to model
+slope_rel_from_data <- function(df, id_var, time_var, outcome_var) {
+  
+  # rename to match lmer formula
+  df <- rename(df, score = all_of(outcome_var))
+  
+  #numerator
+  lme_fit <- suppressWarnings(
+    lmer(score ~ 1 + wave + (1 + wave | sid), REML = FALSE, data = df) #from assignment
+  )
+  
+  true_var <- as.data.frame(VarCorr(lme_fit)) |>
+    filter(grp == id_var, var1 == time_var, is.na(var2)) |>
+    pull(vcov)
+  
+  #denominator- week 4 slides
+  obs_slopes <- split(df, df[[id_var]]) |>
+    map_dbl(~coef(lm(score ~ 1 + wave, data = .x))[["wave"]])
+  
+  as.numeric(true_var) / var(obs_slopes)
+}
+
+safe_slope_rel <- safely(slope_rel_from_data) #week 5
+# run bootstraps for each grade x subject
+set.seed(2026) #don't need but wanted to keep to check (reproducible)
+n_boot <- 100
+
+ci_results <- map_dfr(c(3, 4, 5), function(g) {
+  map_dfr(c("reading", "math"), function(subj) {
+    
+    df_sub <- benchmarks |> filter(grade == g) #filter grade at time
+    
+    #100 bootstrap samples
+    boots <- bootstrap_samples(df_sub, "sid", "wave", subj, n_boot)
+    
+    #week 4: map_dbl() to apply function to list
+      boot_rels <- map(boots, ~safe_slope_rel(.x, "sid", "wave", subj)) |>
+        map("result") |> #week 5
+        compact() |>
+        map_dbl(~.x)
+    
+    tibble(
+      grade   = g,
+      subject = subj,
+      n       = n_distinct(df_sub$sid),
+      ci_lower           = round(quantile(boot_rels, 0.025), 4),
+      ci_upper           = round(quantile(boot_rels, 0.975), 4),
+      median_reliability = round(median(boot_rels), 4)
+    )
+  })
+})
+
+ci_results |>
+  knitr::kable(col.names = c("Grade", "Subject", "N", 
+                              "95% CI Lower", "95% CI Upper", 
+                              "Median Reliability"))
+```
+
